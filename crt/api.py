@@ -51,7 +51,8 @@ from schema import ENTITY_SCHEMA
 from neo4j import GraphDatabase
 from taxonomy import SkillTaxonomySeeder, GraphRAGLinker
 from query_engine import GraphQueryEngine
-from evaluator import CandidateEvaluator, JDSignature
+from jd_parser import JobDescriptionParser
+from evaluator import CandidateEvaluator
 
 # ---------------------------------------------------------------------------
 # Logging – file + console
@@ -75,6 +76,7 @@ _driver                                = None
 _ingestion: Optional[SecureIngestionPipeline] = None
 _graph:     Optional[KnowledgeGraphBuilder]   = None
 _qe:        Optional[GraphQueryEngine]        = None
+_jd_parser: Optional[JobDescriptionParser]    = None
 
 MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "20"))
 ALLOWED_EXTS  = {".pdf", ".docx"}
@@ -93,6 +95,7 @@ async def lifespan(app: FastAPI):
     _graph     = KnowledgeGraphBuilder(_cfg)
     _driver    = _graph.driver
     _qe        = GraphQueryEngine(_driver)
+    _jd_parser = JobDescriptionParser()
 
     # Seed taxonomy once (idempotent)
     seeder = SkillTaxonomySeeder(_driver)
@@ -164,13 +167,6 @@ def _check_injection(text: str) -> None:
 # ---------------------------------------------------------------------------
 # Pydantic Models
 # ---------------------------------------------------------------------------
-class EvaluateRequest(BaseModel):
-    jd_text: str    = Field(..., min_length=50, description="Raw job description text")
-    top_n:   int    = Field(10,  ge=1, le=50)
-    nice_to_have: List[str] = Field(default_factory=list)
-    use_llm: bool   = Field(False, description="Enable Ollama LLM narrative summaries")
-
-
 class SkillQueryRequest(BaseModel):
     skill: str
     ecosystem: bool = True   # use multi-hop traversal if True
@@ -293,39 +289,68 @@ async def find_security_candidates(
     return _qe.find_security_candidates(dom, lng)
 
 
-# ── JD Evaluation ────────────────────────────────────────────────────────────
+# ── JD Evaluation (DOCX upload) ───────────────────────────────────────
 
 @app.post("/evaluate", tags=["Evaluation"])
-async def evaluate_candidates(req: EvaluateRequest):
+async def evaluate_candidates(
+    file: UploadFile = File(..., description="Job description DOCX or PDF"),
+    top_n:   int  = Form(10),
+    use_llm: bool = Form(False),
+):
     """
-    Parse a JD → extract required skills → rank all candidates in graph.
-    Optionally uses local Ollama LLM for narrative summaries (use_llm=true).
+    Upload a Job Description DOCX/PDF.
+    The system parses it, extracts required + nice-to-have skills, certifications,
+    degree requirements, and experience thresholds — then ranks all ingested
+    candidates in the knowledge graph against the JD.
     """
-    _check_injection(req.jd_text)
+    # Validate file type
+    ext = Path(file.filename or "").suffix.lower()
+    if ext not in ALLOWED_EXTS:
+        raise HTTPException(400, f"Unsupported file type '{ext}'. Allowed: {ALLOWED_EXTS}")
 
-    evaluator = CandidateEvaluator(_driver)
-    sig = JDSignature(
-        raw_jd_text  = req.jd_text,
-        top_n        = req.top_n,
-        nice_to_have = req.nice_to_have,
-    )
-    result = evaluator.evaluate(sig, use_llm=req.use_llm)
+    # Read and size-check
+    contents = await file.read()
+    if len(contents) > MAX_UPLOAD_MB * 1024 * 1024:
+        raise HTTPException(413, f"File exceeds {MAX_UPLOAD_MB} MB limit.")
 
-    return {
-        "jd_required_skills":         result.jd_required_skills,
-        "jd_nice_to_have":            result.jd_nice_to_have,
-        "total_candidates_evaluated": result.total_candidates_evaluated,
-        "ranked_candidates": [
-            {
-                "rank":             i + 1,
-                "candidate_id":     cs.candidate_id,
-                "file_name":        cs.file_name,
-                "score":            cs.score,
-                "coverage_pct":     f"{cs.coverage_pct:.0%}",
-                "required_matched": cs.required_matched,
-                "nice_matched":     cs.nice_matched,
-                "llm_summary":      cs.llm_summary,
-            }
-            for i, cs in enumerate(result.ranked_candidates)
-        ],
-    }
+    # Save to temp file
+    with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
+        tmp.write(contents)
+        tmp_path = tmp.name
+
+    try:
+        # Parse JD document → JDProfile
+        jd_profile = _jd_parser.parse(tmp_path)
+
+        # Evaluate all candidates
+        evaluator = CandidateEvaluator(_driver)
+        result    = evaluator.evaluate(jd_profile, use_llm=use_llm, top_n=top_n)
+
+        return {
+            "jd_source":                   result.jd_source,
+            "jd_job_title":                result.jd_job_title,
+            "jd_required_skills":          result.jd_required_skills,
+            "jd_nice_to_have":             result.jd_nice_to_have,
+            "jd_certifications":           result.jd_certifications,
+            "jd_degrees":                  result.jd_degrees,
+            "jd_min_experience_years":     result.jd_min_experience,
+            "total_candidates_evaluated":  result.total_candidates_evaluated,
+            "ranked_candidates": [
+                {
+                    "rank":             cs.rank,
+                    "candidate_id":     cs.candidate_id,
+                    "file_name":        cs.file_name,
+                    "total_score":      cs.total_score,
+                    "coverage_pct":     f"{cs.coverage_pct:.0%}",
+                    "required_matched": cs.required_matched,
+                    "nice_matched":     cs.nice_matched,
+                    "cert_matched":     cs.cert_matched,
+                    "degree_matched":   cs.degree_matched,
+                    "gaps":             cs.gaps,
+                    "llm_summary":      cs.llm_summary,
+                }
+                for cs in result.ranked_candidates
+            ],
+        }
+    finally:
+        os.unlink(tmp_path)

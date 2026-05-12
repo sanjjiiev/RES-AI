@@ -1,14 +1,20 @@
 """
-Phase 4 – evaluator.py
-=======================
-JD-based candidate evaluation using:
-• GLiNER  : parse required skills from raw job description text
-• Neo4j   : graph-based candidate ranking (query_engine.py)
-• Ollama  : optional LLM reasoning for final narrative summary
-            (uses the local model specified in OLLAMA_MODEL env var)
+evaluator.py – Candidate Evaluation Engine  (Phase 4)
+=======================================================
+Accepts a JDProfile (from jd_parser.py) and ranks all candidates
+in the Neo4j knowledge graph against it.
 
-DSPy-style structured signature is emulated with dataclasses since
-we're running fully local (no OpenAI dependency).
+Scoring model
+-------------
+• Required skill match  : +2 pts each
+• Nice-to-have match    : +1 pt each
+• Certification match   : +3 pts each (high weight — often mandatory)
+• Degree match          : +2 pts each
+• Experience coverage   : bonus +2 if candidate has any experience entity
+                          and the JD specifies a min_years_experience
+
+Optional: Ollama LLM generates a 3-sentence narrative for each top candidate.
+          Falls back silently if Ollama is not running.
 """
 
 from __future__ import annotations
@@ -16,6 +22,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import urllib.request
 import warnings
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
@@ -24,76 +31,42 @@ warnings.filterwarnings("ignore")
 
 logger = logging.getLogger("RES-AI.Evaluator")
 
-# ---------------------------------------------------------------------------
-# DSPy-style Signature (structured I/O contract)
-# ---------------------------------------------------------------------------
 
-@dataclass
-class JDSignature:
-    """Input contract for job description evaluation."""
-    raw_jd_text: str
-    top_n: int = 10
-    nice_to_have: List[str] = field(default_factory=list)
-
+# ---------------------------------------------------------------------------
+# Output Data Classes
+# ---------------------------------------------------------------------------
 
 @dataclass
 class CandidateScore:
-    """Output contract for one ranked candidate."""
+    """Scored result for one candidate."""
+    rank: int
     candidate_id: str
     file_name: str
-    score: int
+    total_score: int
+    coverage_pct: float          # required skills covered (0.0 – 1.0)
+
     required_matched: List[str]
     nice_matched: List[str]
-    coverage_pct: float           # required skills covered
+    cert_matched: List[str]
+    degree_matched: List[str]
+    has_experience_node: bool
+
+    gaps: List[str]              # required skills NOT matched
     llm_summary: Optional[str] = None
 
 
 @dataclass
 class EvaluationResult:
-    """Full output for a JD evaluation run."""
+    """Full output of a JD evaluation run."""
+    jd_source: str
+    jd_job_title: str
     jd_required_skills: List[str]
     jd_nice_to_have: List[str]
-    ranked_candidates: List[CandidateScore]
+    jd_certifications: List[str]
+    jd_degrees: List[str]
+    jd_min_experience: Optional[int]
     total_candidates_evaluated: int
-
-
-# ---------------------------------------------------------------------------
-# JD PARSER (GLiNER-based)
-# ---------------------------------------------------------------------------
-
-class JobDescriptionParser:
-    """
-    Extracts required technical skills from raw JD text using GLiNER —
-    the same model used for resume parsing, so vocabulary is consistent.
-    """
-
-    JD_LABELS = [
-        "Programming Language", "Framework", "Database",
-        "Cloud Platform", "Security Tool", "Certification",
-        "Soft Skill", "Industry", "Job Title",
-    ]
-
-    def __init__(self, gliner_model=None) -> None:
-        self._log = logging.getLogger("RES-AI.JDParser")
-        if gliner_model is None:
-            from gliner import GLiNER
-            model_name = os.getenv("GLINER_MODEL", "urchade/gliner_medium-v2.1")
-            self._log.info("Loading GLiNER for JD parsing: %s", model_name)
-            gliner_model = GLiNER.from_pretrained(model_name)
-        self.model = gliner_model
-
-    def parse(self, jd_text: str, threshold: float = 0.35) -> Dict[str, List[str]]:
-        """Extract and deduplicate skill entities from a JD."""
-        import re
-        entities = self.model.predict_entities(jd_text, self.JD_LABELS, threshold=threshold)
-        result: Dict[str, List[str]] = {}
-        for ent in entities:
-            norm = re.sub(r"\s+", " ", ent["text"].strip()).title()
-            result.setdefault(ent["label"], [])
-            if norm not in result[ent["label"]]:
-                result[ent["label"]].append(norm)
-        self._log.info("JD parsed: %d skill categories found.", len(result))
-        return result
+    ranked_candidates: List[CandidateScore]
 
 
 # ---------------------------------------------------------------------------
@@ -102,57 +75,118 @@ class JobDescriptionParser:
 
 class CandidateEvaluator:
     """
-    Scores and ranks all candidates in the knowledge graph against a JD.
+    Scores and ranks all candidates in Neo4j against a JDProfile.
 
-    Workflow (DSPy-style)
-    ─────────────────────
-    1. Parse JD with GLiNER → required + nice-to-have skill lists
-    2. Query Neo4j graph  → ranked candidate list with match counts
-    3. (Optional) Send top candidates to local Ollama LLM for a narrative
-       reasoning summary (Bootstrap-style: structured prompt → structured output)
+    Workflow
+    --------
+    1. Receive a JDProfile (already parsed from DOCX by JobDescriptionParser)
+    2. Run a single graph query that fetches all candidate skill data
+    3. Score each candidate in Python (avoids complex Cypher scoring logic)
+    4. Optionally call Ollama for a narrative summary of each top-N candidate
     """
 
     def __init__(self, driver, gliner_model=None) -> None:
-        self.driver    = driver
-        self._log      = logging.getLogger("RES-AI.Evaluator")
-        self.jd_parser = JobDescriptionParser(gliner_model)
-
-        # Optional Ollama client
-        self._ollama_url   = os.getenv("OLLAMA_URL",   "http://localhost:11434")
-        self._ollama_model = os.getenv("OLLAMA_MODEL", "deepseek-r1:8b")
+        self.driver      = driver
+        self._log        = logging.getLogger("RES-AI.Evaluator")
+        self._ollama_url = os.getenv("OLLAMA_URL",   "http://localhost:11434")
+        self._ollama_mdl = os.getenv("OLLAMA_MODEL", "deepseek-r1:8b")
 
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
 
-    def _flat_skills(self, parsed: Dict[str, List[str]]) -> List[str]:
-        """Flatten category dict into a single list of skill names."""
-        return [skill for skills in parsed.values() for skill in skills]
+    def _fetch_all_candidates(self) -> Dict[str, Dict]:
+        """
+        Single Neo4j query: pull every candidate + all their linked entity names.
+        Returns: {candidate_id: {file_name, skills: set, certs: set, degrees: set, has_exp: bool}}
+        """
+        with self.driver.session() as session:
+            rows = session.run(
+                """
+                MATCH (c:Candidate)-[r]->(n)
+                RETURN
+                    c.id        AS candidate_id,
+                    c.file_name AS file_name,
+                    type(r)     AS rel_type,
+                    n.name      AS skill_name
+                """
+            )
+            candidates: Dict[str, Dict] = {}
+            for row in rows:
+                cid = row["candidate_id"]
+                if cid not in candidates:
+                    candidates[cid] = {
+                        "file_name": row["file_name"] or "",
+                        "skills":    set(),
+                        "certs":     set(),
+                        "degrees":   set(),
+                        "has_exp":   False,
+                    }
+                rel  = row["rel_type"]
+                name = row["skill_name"] or ""
+                if rel == "HAS_CERTIFICATION":
+                    candidates[cid]["certs"].add(name)
+                elif rel == "HOLDS_DEGREE":
+                    candidates[cid]["degrees"].add(name)
+                elif rel == "HAS_EXPERIENCE":
+                    candidates[cid]["has_exp"] = True
+                else:
+                    candidates[cid]["skills"].add(name)
+        return candidates
 
-    def _ollama_summarise(self, candidate_id: str, score: CandidateScore, jd_text: str) -> str:
+    def _score_candidate(
+        self,
+        cdata: Dict,
+        jd,       # JDProfile
+    ) -> tuple[int, List[str], List[str], List[str], List[str], float, List[str]]:
         """
-        Call local Ollama for a structured reasoning summary.
-        Returns empty string on failure (LLM is optional).
+        Score one candidate against the JDProfile.
+        Returns: (score, req_matched, nice_matched, cert_matched, deg_matched, coverage, gaps)
         """
+        skills  = cdata["skills"]
+        certs   = cdata["certs"]
+        degrees = cdata["degrees"]
+        has_exp = cdata["has_exp"]
+
+        req_matched  = [s for s in jd.required_skills      if s in skills]
+        nice_matched = [s for s in jd.nice_to_have_skills   if s in skills]
+        cert_matched = [c for c in jd.required_certifications if c in certs]
+        deg_matched  = [d for d in jd.required_degrees       if d in degrees]
+        gaps         = [s for s in jd.required_skills if s not in skills]
+
+        score  = len(req_matched) * 2
+        score += len(nice_matched) * 1
+        score += len(cert_matched) * 3
+        score += len(deg_matched)  * 2
+        if has_exp and jd.min_years_experience:
+            score += 2
+
+        coverage = (
+            len(req_matched) / len(jd.required_skills)
+            if jd.required_skills else 0.0
+        )
+        return score, req_matched, nice_matched, cert_matched, deg_matched, coverage, gaps
+
+    def _llm_summary(self, cs: CandidateScore, jd) -> str:
+        """Call local Ollama for a 3-sentence candidate narrative. Silent on failure."""
         try:
-            import urllib.request
             prompt = (
-                f"You are an expert technical recruiter.\n\n"
-                f"Job Description:\n{jd_text[:800]}\n\n"
-                f"Candidate ID: {candidate_id}\n"
-                f"Required skills matched: {score.required_matched}\n"
-                f"Nice-to-have matched: {score.nice_matched}\n"
-                f"Coverage: {score.coverage_pct:.0%}\n\n"
-                f"Write a 3-sentence evaluation of this candidate for this role. "
-                f"Be concise and factual. Highlight gaps if coverage < 60%."
+                f"You are an expert technical recruiter. Be concise.\n\n"
+                f"Job: {jd.job_titles[0] if jd.job_titles else 'Unknown Role'}\n"
+                f"Required skills: {', '.join(jd.required_skills[:8])}\n\n"
+                f"Candidate matched: {', '.join(cs.required_matched)}\n"
+                f"Gaps: {', '.join(cs.gaps[:5]) or 'None'}\n"
+                f"Certifications: {', '.join(cs.cert_matched) or 'None'}\n"
+                f"Coverage: {cs.coverage_pct:.0%}\n\n"
+                f"Write exactly 3 sentences: overall fit, key strengths, main gaps."
             )
             body = json.dumps({
-                "model": self._ollama_model,
-                "prompt": prompt,
-                "stream": False,
-                "options": {"temperature": 0.3, "num_predict": 200},
+                "model":   self._ollama_mdl,
+                "prompt":  prompt,
+                "stream":  False,
+                "options": {"temperature": 0.2, "num_predict": 200},
             }).encode()
-            req  = urllib.request.Request(
+            req = urllib.request.Request(
                 f"{self._ollama_url}/api/generate",
                 data=body, method="POST",
                 headers={"Content-Type": "application/json"},
@@ -168,49 +202,72 @@ class CandidateEvaluator:
     # Public API
     # ------------------------------------------------------------------
 
-    def evaluate(self, sig: JDSignature, use_llm: bool = False) -> EvaluationResult:
+    def evaluate(self, jd, use_llm: bool = False, top_n: int = 10) -> EvaluationResult:
         """
-        Main entry point.  Pass a JDSignature, get back an EvaluationResult.
+        Main entry point.
+
+        Parameters
+        ----------
+        jd      : JDProfile  (output of JobDescriptionParser.parse())
+        use_llm : bool       enable Ollama narrative summaries
+        top_n   : int        max candidates in output
+
+        Returns
+        -------
+        EvaluationResult
         """
-        from query_engine import GraphQueryEngine
+        from jd_parser import JDProfile  # local import to avoid circular dep
+        self._log.info(
+            "Evaluating: %s | required=%d, nice=%d, certs=%d",
+            jd.summary(), len(jd.required_skills),
+            len(jd.nice_to_have_skills), len(jd.required_certifications),
+        )
 
-        self._log.info("Evaluating JD (top_n=%d, llm=%s)…", sig.top_n, use_llm)
+        # 1. Fetch all candidate data in one query
+        candidates = self._fetch_all_candidates()
+        self._log.info("Scoring %d candidates…", len(candidates))
 
-        # Step 1: Parse JD
-        parsed = self.jd_parser.parse(sig.raw_jd_text)
-        required   = self._flat_skills(parsed)
-        nice       = sig.nice_to_have
-        self._log.info("JD skills: %d required, %d nice-to-have.", len(required), len(nice))
+        # 2. Score every candidate
+        scored: List[CandidateScore] = []
+        for cid, cdata in candidates.items():
+            score, req_m, nice_m, cert_m, deg_m, cov, gaps = self._score_candidate(cdata, jd)
+            scored.append(CandidateScore(
+                rank              = 0,          # assigned after sort
+                candidate_id      = cid,
+                file_name         = cdata["file_name"],
+                total_score       = score,
+                coverage_pct      = round(cov, 4),
+                required_matched  = req_m,
+                nice_matched      = nice_m,
+                cert_matched      = cert_m,
+                degree_matched    = deg_m,
+                has_experience_node = cdata["has_exp"],
+                gaps              = gaps,
+            ))
 
-        # Step 2: Graph ranking
-        qe   = GraphQueryEngine(self.driver)
-        rows = qe.rank_candidates_for_jd(required, nice, top_n=sig.top_n)
+        # 3. Sort: primary = total_score desc, secondary = coverage desc
+        scored.sort(key=lambda c: (-c.total_score, -c.coverage_pct))
+        top = scored[:top_n]
 
-        scores: List[CandidateScore] = []
-        for row in rows:
-            req_matched  = row.get("req_matched", [])
-            nice_matched = row.get("nice_matched", [])
-            coverage     = len(req_matched) / len(required) if required else 0.0
-            cs = CandidateScore(
-                candidate_id     = row["candidate_id"],
-                file_name        = row.get("file", ""),
-                score            = row.get("score", 0),
-                required_matched = req_matched,
-                nice_matched     = nice_matched,
-                coverage_pct     = round(coverage, 4),
-            )
-            # Step 3: Optional LLM narrative
-            if use_llm:
-                cs.llm_summary = self._ollama_summarise(cs.candidate_id, cs, sig.raw_jd_text)
-            scores.append(cs)
+        # 4. Assign ranks + optional LLM summaries
+        for i, cs in enumerate(top):
+            cs.rank = i + 1
+            if use_llm and cs.total_score > 0:
+                cs.llm_summary = self._llm_summary(cs, jd)
 
         self._log.info(
-            "Evaluation complete: %d candidates ranked. Top score: %d",
-            len(scores), scores[0].score if scores else 0,
+            "Evaluation complete: top score=%d, coverage=%.0f%%",
+            top[0].total_score if top else 0,
+            (top[0].coverage_pct * 100) if top else 0,
         )
         return EvaluationResult(
-            jd_required_skills          = required,
-            jd_nice_to_have             = nice,
-            ranked_candidates           = scores,
-            total_candidates_evaluated  = len(scores),
+            jd_source                   = jd.source_file,
+            jd_job_title                = jd.job_titles[0] if jd.job_titles else "",
+            jd_required_skills          = jd.required_skills,
+            jd_nice_to_have             = jd.nice_to_have_skills,
+            jd_certifications           = jd.required_certifications,
+            jd_degrees                  = jd.required_degrees,
+            jd_min_experience           = jd.min_years_experience,
+            total_candidates_evaluated  = len(candidates),
+            ranked_candidates           = top,
         )

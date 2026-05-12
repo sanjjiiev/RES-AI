@@ -115,52 +115,67 @@ def cmd_ingest(args):
 
 
 def cmd_evaluate(args):
-    from evaluator import CandidateEvaluator, JDSignature
+    from jd_parser import JobDescriptionParser
+    from evaluator import CandidateEvaluator
+
+    jd_file = args.jd_file
+    if not os.path.exists(jd_file):
+        logger.error("JD file not found: %s", jd_file)
+        sys.exit(1)
 
     cfg    = _get_config()
     driver = _get_driver(cfg)
 
-    jd_text = args.jd
-    if not jd_text and args.jd_file:
-        jd_text = Path(args.jd_file).read_text(encoding="utf-8")
+    # Parse the JD document
+    jd_parser = JobDescriptionParser()
+    jd_profile = jd_parser.parse(jd_file)
 
-    if not jd_text:
-        logger.error("Provide --jd 'text' or --jd-file path.")
-        sys.exit(1)
+    logger.info("-" * 60)
+    logger.info("JD PARSED: %s", jd_profile.summary())
+    logger.info("  Required skills   : %s", ", ".join(jd_profile.required_skills[:8]))
+    logger.info("  Nice-to-have      : %s", ", ".join(jd_profile.nice_to_have_skills[:5]))
+    logger.info("  Certifications    : %s", ", ".join(jd_profile.required_certifications))
+    logger.info("  Degrees           : %s", ", ".join(jd_profile.required_degrees))
+    logger.info("  Min experience    : %s yr", jd_profile.min_years_experience or "not specified")
+    logger.info("-" * 60)
 
+    # Evaluate candidates
     evaluator = CandidateEvaluator(driver)
-    sig       = JDSignature(raw_jd_text=jd_text, top_n=args.top_n)
-    result    = evaluator.evaluate(sig, use_llm=args.llm)
-
+    result    = evaluator.evaluate(jd_profile, use_llm=args.llm, top_n=args.top_n)
     driver.close()
 
     logger.info("\n%s", "=" * 60)
-    logger.info("JD EVALUATION RESULTS")
-    logger.info("Required skills: %s", ", ".join(result.jd_required_skills[:10]))
-    logger.info("%s", "=" * 60)
+    logger.info("CANDIDATE RANKINGS  (%d evaluated)", result.total_candidates_evaluated)
+    logger.info("=" * 60)
 
-    for i, cs in enumerate(result.ranked_candidates):
+    for cs in result.ranked_candidates:
         logger.info(
-            "Rank %2d | %-40s | score=%d | coverage=%s",
-            i + 1, cs.candidate_id, cs.score, f"{cs.coverage_pct:.0%}",
+            "Rank %2d | %-38s | score=%-3d | coverage=%s",
+            cs.rank, cs.candidate_id, cs.total_score, f"{cs.coverage_pct:.0%}",
         )
         if cs.required_matched:
-            logger.info("         matched: %s", ", ".join(cs.required_matched[:6]))
+            logger.info("         matched : %s", ", ".join(cs.required_matched[:6]))
+        if cs.gaps:
+            logger.info("         gaps    : %s", ", ".join(cs.gaps[:4]))
         if cs.llm_summary:
-            logger.info("         summary: %s", cs.llm_summary)
+            logger.info("         summary : %s", cs.llm_summary)
 
     if args.json:
         _print_json([
             {
-                "rank": i + 1,
-                "candidate_id": cs.candidate_id,
-                "score": cs.score,
-                "coverage": f"{cs.coverage_pct:.0%}",
+                "rank":             cs.rank,
+                "candidate_id":     cs.candidate_id,
+                "file_name":        cs.file_name,
+                "total_score":      cs.total_score,
+                "coverage":         f"{cs.coverage_pct:.0%}",
                 "required_matched": cs.required_matched,
-                "nice_matched": cs.nice_matched,
-                "llm_summary": cs.llm_summary,
+                "nice_matched":     cs.nice_matched,
+                "cert_matched":     cs.cert_matched,
+                "degree_matched":   cs.degree_matched,
+                "gaps":             cs.gaps,
+                "llm_summary":      cs.llm_summary,
             }
-            for i, cs in enumerate(result.ranked_candidates)
+            for cs in result.ranked_candidates
         ])
 
 
@@ -248,11 +263,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_ingest.add_argument("--json",         action="store_true", help="Print result as JSON")
     p_ingest.set_defaults(func=cmd_ingest)
 
-    # ── evaluate ─────────────────────────────────────────────────────────
-    p_eval = sub.add_parser("evaluate", help="Rank candidates against a job description")
-    jd_grp = p_eval.add_mutually_exclusive_group(required=True)
-    jd_grp.add_argument("--jd",      metavar="TEXT", help="Job description text (quoted)")
-    jd_grp.add_argument("--jd-file", metavar="FILE", help="Path to JD text file")
+    # ── evaluate ────────────────────────────────────────────────────────────
+    p_eval = sub.add_parser("evaluate", help="Rank candidates against a job description DOCX")
+    p_eval.add_argument("--jd-file", required=True, metavar="FILE",
+                        help="Path to a JD DOCX or PDF file")
     p_eval.add_argument("--top-n",   type=int, default=10, help="Max candidates to return (default 10)")
     p_eval.add_argument("--llm",     action="store_true",  help="Use Ollama LLM for narrative summaries")
     p_eval.add_argument("--json",    action="store_true",  help="Print result as JSON")
